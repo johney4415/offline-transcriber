@@ -36,10 +36,13 @@ class App(tk.Tk):
 
         self.dictionary = UserDictionary.load(paths.dictionary_path())
 
+        self._original_text: str = ""  # post-processed transcript before user edits
+
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
         self._build_transcribe_tab(notebook)
         self._build_dictionary_tab(notebook)
+        self._build_learn_tab(notebook)
 
         self.after(100, self._poll_queue)
 
@@ -92,6 +95,16 @@ class App(tk.Tk):
             bottom, text="儲存字幕 (.srt)", command=self._save_srt, state="disabled"
         )
         self.save_srt_btn.pack(side="left", padx=6)
+        self.learn_btn = ttk.Button(
+            bottom,
+            text="從修正學習",
+            command=self._learn_from_edits,
+            state="disabled",
+        )
+        self.learn_btn.pack(side="left", padx=6)
+        ttk.Label(
+            bottom, text="（可直接在上方修改文字，再按「從修正學習」）", foreground="#777"
+        ).pack(side="left")
 
     def _choose_file(self) -> None:
         filename = filedialog.askopenfilename(filetypes=AUDIO_FILETYPES)
@@ -108,6 +121,7 @@ class App(tk.Tk):
             return
 
         self._segments = []
+        self._original_text = ""
         self._cancel.clear()
         self.text.delete("1.0", "end")
         self.progress["value"] = 0
@@ -115,6 +129,7 @@ class App(tk.Tk):
         self.cancel_btn["state"] = "normal"
         self.save_txt_btn["state"] = "disabled"
         self.save_srt_btn["state"] = "disabled"
+        self.learn_btn["state"] = "disabled"
         self.status_var.set("載入模型中…")
 
         self._worker = threading.Thread(
@@ -182,6 +197,9 @@ class App(tk.Tk):
                     if self._segments:
                         self.save_txt_btn["state"] = "normal"
                         self.save_srt_btn["state"] = "normal"
+                        self.learn_btn["state"] = "normal"
+                        # Snapshot for "learn from edits" comparison
+                        self._original_text = self.text.get("1.0", "end-1c")
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -209,6 +227,107 @@ class App(tk.Tk):
         if filename:
             Path(filename).write_text(format_srt(self._segments), encoding="utf-8")
             self.status_var.set(f"已儲存：{filename}")
+
+    # ------------------------------------------------------------------
+    # Learning (correction feedback)
+    # ------------------------------------------------------------------
+
+    def _learn_from_edits(self) -> None:
+        """Compare the edited preview text with the original transcript."""
+        current = self.text.get("1.0", "end-1c")
+        if not self._original_text:
+            return
+        self._run_learning(self._original_text, current)
+
+    def _build_learn_tab(self, notebook: ttk.Notebook) -> None:
+        tab = ttk.Frame(notebook)
+        notebook.add(tab, text="  學習  ")
+
+        hint = (
+            "把校正後的文字「教」給程式：比對原始轉錄檔與你修改後的檔案，\n"
+            "自動找出修正的地方並建議加入字典（同音字 → 詞彙表；其他 → 取代規則）。\n"
+            "比對全程在本機進行，不使用網路。\n\n"
+            "提示：儲存轉錄結果時請保留一份未修改的原始檔，校正時改另一份副本。"
+        )
+        ttk.Label(tab, text=hint, foreground="#555", justify="left").pack(
+            anchor="w", padx=10, pady=(10, 8)
+        )
+
+        form = ttk.Frame(tab)
+        form.pack(fill="x", padx=10)
+        form.columnconfigure(1, weight=1)
+
+        self.learn_orig_var = tk.StringVar()
+        self.learn_fixed_var = tk.StringVar()
+        for row, (label, var) in enumerate(
+            [("原始轉錄檔：", self.learn_orig_var), ("校正後檔案：", self.learn_fixed_var)]
+        ):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(form, textvariable=var).grid(
+                row=row, column=1, sticky="ew", padx=6
+            )
+            ttk.Button(
+                form,
+                text="選擇檔案…",
+                command=lambda v=var: self._pick_text_file(v),
+            ).grid(row=row, column=2)
+
+        ttk.Button(tab, text="開始比對", command=self._learn_from_files).pack(
+            anchor="w", padx=10, pady=10
+        )
+
+    def _pick_text_file(self, var: tk.StringVar) -> None:
+        filename = filedialog.askopenfilename(
+            filetypes=[("文字檔", "*.txt"), ("所有檔案", "*.*")]
+        )
+        if filename:
+            var.set(filename)
+
+    @staticmethod
+    def _read_text_file(path: Path) -> str:
+        data = path.read_bytes()
+        for encoding in ("utf-8-sig", "utf-8", "cp950"):
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="replace")
+
+    def _learn_from_files(self) -> None:
+        orig_path = self.learn_orig_var.get().strip()
+        fixed_path = self.learn_fixed_var.get().strip()
+        if not orig_path or not fixed_path:
+            messagebox.showwarning("提示", "請選擇原始轉錄檔與校正後檔案")
+            return
+        for p in (orig_path, fixed_path):
+            if not Path(p).exists():
+                messagebox.showerror("錯誤", f"找不到檔案：{p}")
+                return
+        original = self._read_text_file(Path(orig_path))
+        corrected = self._read_text_file(Path(fixed_path))
+        self._run_learning(original, corrected)
+
+    def _run_learning(self, original: str, corrected: str) -> None:
+        from learn import apply_suggestions, extract_suggestions
+
+        # Reload so we diff against the user's latest dictionary edits
+        self.dictionary = UserDictionary.load(paths.dictionary_path())
+        suggestions = extract_suggestions(original, corrected, self.dictionary)
+        if not suggestions:
+            messagebox.showinfo(
+                "學習",
+                "沒有找到可以學習的修正。\n"
+                "（可能沒有差異、修改幅度太大，或字典已涵蓋這些修正）",
+            )
+            return
+        accepted = SuggestionDialog(self, suggestions).result
+        if not accepted:
+            return
+        apply_suggestions(accepted, self.dictionary)
+        self._save_dictionary()
+        messagebox.showinfo(
+            "學習", f"已加入 {len(accepted)} 筆到字典，下次轉錄自動套用。"
+        )
 
     # ------------------------------------------------------------------
     # Dictionary tab
@@ -371,6 +490,77 @@ class App(tk.Tk):
         if messagebox.askyesno("確認", f"刪除規則「{rule.src} → {rule.dst}」？"):
             del self.dictionary.replacements[idx]
             self._save_dictionary()
+
+
+class SuggestionDialog(tk.Toplevel):
+    """Review dialog: tick the corrections to add to the dictionary."""
+
+    def __init__(self, parent: tk.Tk, suggestions):
+        super().__init__(parent)
+        self.title("學習建議")
+        self.geometry("560x360")
+        self.result: list = []
+        self._suggestions = suggestions
+        self._checked = [s.preselected for s in suggestions]
+
+        ttk.Label(
+            self,
+            text="找到以下修正，勾選要加入字典的項目（點一下列即可切換勾選）：",
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        self.tree = ttk.Treeview(
+            self,
+            columns=("pick", "kind", "src", "dst"),
+            show="headings",
+            selectmode="none",
+        )
+        for col, title, width, anchor in [
+            ("pick", "加入", 50, "center"),
+            ("kind", "類型", 170, "w"),
+            ("src", "原本辨識", 130, "w"),
+            ("dst", "修正為", 130, "w"),
+        ]:
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, anchor=anchor)
+        self.tree.pack(fill="both", expand=True, padx=12)
+
+        for i, s in enumerate(suggestions):
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                values=("☑" if self._checked[i] else "☐", s.describe(), s.src, s.dst),
+            )
+        self.tree.bind("<Button-1>", self._toggle)
+
+        btns = ttk.Frame(self)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="加入勾選項目", command=self._ok).pack(
+            side="left", padx=4
+        )
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left")
+
+        self.transient(parent)
+        self.grab_set()
+        parent.wait_window(self)
+
+    def _toggle(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        i = int(row)
+        self._checked[i] = not self._checked[i]
+        s = self._suggestions[i]
+        self.tree.item(
+            row,
+            values=("☑" if self._checked[i] else "☐", s.describe(), s.src, s.dst),
+        )
+
+    def _ok(self) -> None:
+        self.result = [
+            s for s, checked in zip(self._suggestions, self._checked) if checked
+        ]
+        self.destroy()
 
 
 class WordDialog(tk.Toplevel):
