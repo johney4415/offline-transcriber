@@ -1,0 +1,29 @@
+{
+  "words": [
+    {
+      "word": "王小明",
+      "enabled": false,
+      "use_prompt": true,
+      "fuzzy": false
+    },
+    {
+      "word": "前賢",
+      "enabled": true,
+      "use_prompt": true,
+      "fuzzy": true
+    },
+    {
+      "word": "後學",
+      "enabled": true,
+      "use_prompt": true,
+      "fuzzy": true
+    }
+  ],
+  "replacements": [
+    {
+      "from": "範例原文字",
+      "to": "範例替換字",
+      "enabled": false
+    }
+  ]
+}

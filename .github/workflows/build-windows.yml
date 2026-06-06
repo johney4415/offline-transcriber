@@ -1,0 +1,46 @@
+name: Build Windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller huggingface-hub
+
+      - name: Download speech model (~1.5GB)
+        run: python scripts/download_model.py model
+
+      - name: Build with PyInstaller
+        run: pyinstaller app.spec --noconfirm
+
+      - name: Bundle model and dictionary into output
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse model dist/OfflineTranscriber/model
+          Copy-Item dictionary.json dist/OfflineTranscriber/
+
+      - name: Smoke test (imports inside the built app)
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/OfflineTranscriber/OfflineTranscriber.exe")) {
+            throw "exe not found"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfflineTranscriber-windows
+          path: dist/OfflineTranscriber
+          retention-days: 14
+          compression-level: 1
