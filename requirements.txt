@@ -3,3 +3,6 @@ ctranslate2>=4.7,<5
 av>=15,<17
 opencc-python-reimplemented>=0.1.7
 pypinyin>=0.53,<1
+# Summarization LLM engine. Windows/Linux use the prebuilt CPU wheels via the
+# --extra-index-url passed in CI / build_windows.bat; macOS builds from source.
+llama-cpp-python>=0.3.2,<0.4

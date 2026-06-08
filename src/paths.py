@@ -18,8 +18,13 @@ def app_dir() -> Path:
 
 
 def model_dir() -> Path:
-    """Model folder shipped next to the executable."""
+    """Speech model folder shipped next to the executable."""
     return app_dir() / "model"
+
+
+def llm_path() -> Path:
+    """Local LLM (GGUF) used for offline summarization."""
+    return app_dir() / "llm" / "qwen2.5-3b-instruct-q4_k_m.gguf"
 
 
 def dictionary_path() -> Path:

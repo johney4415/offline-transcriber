@@ -37,10 +37,15 @@ class App(tk.Tk):
         self.dictionary = UserDictionary.load(paths.dictionary_path())
 
         self._original_text: str = ""  # post-processed transcript before user edits
+        self._summarizer = None  # lazy-loaded LLM
+        self._sum_worker: threading.Thread | None = None
+        self._sum_cancel = threading.Event()
+        self._opencc_tw = None  # lazy s2twp converter for summary output
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
         self._build_transcribe_tab(notebook)
+        self._build_summary_tab(notebook)
         self._build_dictionary_tab(notebook)
         self._build_learn_tab(notebook)
 
@@ -200,6 +205,23 @@ class App(tk.Tk):
                         self.learn_btn["state"] = "normal"
                         # Snapshot for "learn from edits" comparison
                         self._original_text = self.text.get("1.0", "end-1c")
+                elif kind == "sum_status":
+                    self.sum_status_var.set(payload)
+                elif kind == "sum_token":
+                    self.sum_output.insert("end", payload)
+                    self.sum_output.see("end")
+                elif kind == "sum_error":
+                    self.sum_status_var.set("發生錯誤")
+                    messagebox.showerror("錯誤", payload)
+                elif kind == "sum_done":
+                    # Normalize the whole summary to Traditional Chinese once
+                    text = self.sum_output.get("1.0", "end-1c")
+                    if text.strip():
+                        self.sum_output.delete("1.0", "end")
+                        self.sum_output.insert("end", self._to_traditional(text))
+                        self.sum_save_btn["state"] = "normal"
+                    self.sum_start_btn["state"] = "normal"
+                    self.sum_cancel_btn["state"] = "disabled"
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -227,6 +249,132 @@ class App(tk.Tk):
         if filename:
             Path(filename).write_text(format_srt(self._segments), encoding="utf-8")
             self.status_var.set(f"已儲存：{filename}")
+
+    # ------------------------------------------------------------------
+    # Summary tab (offline LLM)
+    # ------------------------------------------------------------------
+
+    def _build_summary_tab(self, notebook: ttk.Notebook) -> None:
+        from summarizer import DEFAULT_INSTRUCTION
+
+        tab = ttk.Frame(notebook)
+        notebook.add(tab, text="  重點整理  ")
+
+        ttk.Label(
+            tab,
+            text="用本機語言模型整理逐字稿（離線、不使用網路）。可自訂下方指令。",
+            foreground="#555",
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+
+        inst_frame = ttk.Frame(tab)
+        inst_frame.pack(fill="x", padx=10, pady=4)
+        ttk.Label(inst_frame, text="整理指令：").pack(side="left")
+        self.sum_instruction_var = tk.StringVar(value=DEFAULT_INSTRUCTION)
+        ttk.Entry(inst_frame, textvariable=self.sum_instruction_var).pack(
+            side="left", fill="x", expand=True, padx=(0, 6)
+        )
+
+        src_head = ttk.Frame(tab)
+        src_head.pack(fill="x", padx=10, pady=(6, 0))
+        ttk.Label(src_head, text="來源逐字稿：").pack(side="left")
+        ttk.Button(
+            src_head, text="帶入轉錄結果", command=self._fill_summary_source
+        ).pack(side="left", padx=6)
+
+        self.sum_source = tk.Text(tab, wrap="char", height=8, font=("", 12))
+        self.sum_source.pack(fill="both", expand=True, padx=10, pady=4)
+
+        ctrl = ttk.Frame(tab)
+        ctrl.pack(fill="x", padx=10, pady=4)
+        self.sum_start_btn = ttk.Button(
+            ctrl, text="整理重點", command=self._start_summary
+        )
+        self.sum_start_btn.pack(side="left")
+        self.sum_cancel_btn = ttk.Button(
+            ctrl, text="取消", command=self._sum_cancel.set, state="disabled"
+        )
+        self.sum_cancel_btn.pack(side="left", padx=6)
+        self.sum_status_var = tk.StringVar(value="就緒")
+        ttk.Label(ctrl, textvariable=self.sum_status_var).pack(side="left", padx=12)
+
+        ttk.Label(tab, text="整理結果：", foreground="#555").pack(
+            anchor="w", padx=10, pady=(6, 0)
+        )
+        self.sum_output = tk.Text(tab, wrap="char", height=10, font=("", 13))
+        self.sum_output.pack(fill="both", expand=True, padx=10, pady=4)
+
+        bottom = ttk.Frame(tab)
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+        self.sum_save_btn = ttk.Button(
+            bottom, text="儲存整理結果 (.txt)", command=self._save_summary, state="disabled"
+        )
+        self.sum_save_btn.pack(side="left")
+
+    def _fill_summary_source(self) -> None:
+        text = self.text.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showinfo("提示", "目前沒有轉錄結果，請先在「轉錄」分頁完成轉錄。")
+            return
+        self.sum_source.delete("1.0", "end")
+        self.sum_source.insert("end", text)
+
+    def _to_traditional(self, text: str) -> str:
+        """Convert any stray simplified output to Traditional Chinese (Taiwan)."""
+        if self._opencc_tw is None:
+            from opencc import OpenCC
+
+            self._opencc_tw = OpenCC("s2twp")
+        return self._opencc_tw.convert(text)
+
+    def _start_summary(self) -> None:
+        transcript = self.sum_source.get("1.0", "end-1c").strip()
+        if not transcript:
+            messagebox.showwarning("提示", "請先帶入或貼上要整理的逐字稿")
+            return
+        self._sum_cancel.clear()
+        self.sum_output.delete("1.0", "end")
+        self.sum_start_btn["state"] = "disabled"
+        self.sum_cancel_btn["state"] = "normal"
+        self.sum_save_btn["state"] = "disabled"
+        self.sum_status_var.set("載入語言模型中…（第一次較久）")
+
+        instruction = self.sum_instruction_var.get()
+        self._sum_worker = threading.Thread(
+            target=self._run_summary, args=(transcript, instruction), daemon=True
+        )
+        self._sum_worker.start()
+
+    def _run_summary(self, transcript: str, instruction: str) -> None:
+        try:
+            from summarizer import Summarizer
+
+            if self._summarizer is None:
+                self._summarizer = Summarizer(paths.llm_path())
+            self._queue.put(("sum_status", "整理中…"))
+            self._summarizer.summarize(
+                transcript,
+                instruction=instruction,
+                on_token=lambda t: self._queue.put(("sum_token", t)),
+                on_status=lambda s: self._queue.put(("sum_status", s)),
+                should_cancel=self._sum_cancel.is_set,
+            )
+            self._queue.put(
+                ("sum_status", "已取消" if self._sum_cancel.is_set() else "完成")
+            )
+        except Exception as exc:
+            self._queue.put(("sum_error", str(exc)))
+        finally:
+            self._queue.put(("sum_done", None))
+
+    def _save_summary(self) -> None:
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt", initialfile="重點整理.txt"
+        )
+        if filename:
+            Path(filename).write_text(
+                self.sum_output.get("1.0", "end-1c") + "\n", encoding="utf-8"
+            )
+            self.sum_status_var.set(f"已儲存：{filename}")
 
     # ------------------------------------------------------------------
     # Learning (correction feedback)

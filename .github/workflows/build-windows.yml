@@ -16,44 +16,51 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller huggingface-hub
+        run: >
+          pip install -r requirements.txt pyinstaller huggingface-hub
+          --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
-      - name: Cache speech model
+      - name: Cache models (speech + LLM)
         id: model-cache
         uses: actions/cache@v4
         with:
-          path: model
-          key: whisper-large-v3-turbo-ct2-v1
+          path: |
+            model
+            llm
+          key: models-whisper-turbo-qwen25-3b-v1
 
-      - name: Download speech model (~1.5GB)
+      - name: Download models (~3.6GB)
         if: steps.model-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           # HF rate-limits shared CI IPs (429) - retry with backoff
           $delays = 30, 60, 120, 240
           foreach ($d in $delays + 0) {
-            python scripts/download_model.py model
-            if ($LASTEXITCODE -eq 0) { exit 0 }
-            if ($d -eq 0) { break }
+            python scripts/download_model.py .
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($d -eq 0) { exit 1 }
             Write-Host "Download failed, retrying in $d s ..."
             Start-Sleep -Seconds $d
           }
-          exit 1
 
       - name: Build with PyInstaller
         run: pyinstaller app.spec --noconfirm
 
-      - name: Bundle model and dictionary into output
+      - name: Bundle models and dictionary into output
         shell: pwsh
         run: |
           Copy-Item -Recurse model dist/OfflineTranscriber/model
+          Copy-Item -Recurse llm dist/OfflineTranscriber/llm
           Copy-Item dictionary.json dist/OfflineTranscriber/
 
-      - name: Smoke test (imports inside the built app)
+      - name: Smoke test (built exe exists)
         shell: pwsh
         run: |
           if (!(Test-Path "dist/OfflineTranscriber/OfflineTranscriber.exe")) {
             throw "exe not found"
+          }
+          if (!(Test-Path "dist/OfflineTranscriber/llm/qwen2.5-3b-instruct-q4_k_m.gguf")) {
+            throw "LLM model not bundled"
           }
 
       - name: Upload artifact
